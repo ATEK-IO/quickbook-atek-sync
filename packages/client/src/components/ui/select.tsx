@@ -14,6 +14,7 @@ interface SelectProps {
   placeholder?: string
   searchable?: boolean
   className?: string
+  buttonClassName?: string
   disabled?: boolean
 }
 
@@ -24,6 +25,7 @@ export function Select({
   placeholder = 'Select...',
   searchable = false,
   className,
+  buttonClassName,
   disabled,
 }: SelectProps) {
   const [isOpen, setIsOpen] = React.useState(false)
@@ -60,7 +62,8 @@ export function Select({
           'hover:bg-accent hover:text-accent-foreground',
           'focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2',
           disabled && 'opacity-50 cursor-not-allowed',
-          isOpen && 'ring-2 ring-ring ring-offset-2'
+          isOpen && 'ring-2 ring-ring ring-offset-2',
+          buttonClassName
         )}
         disabled={disabled}
       >

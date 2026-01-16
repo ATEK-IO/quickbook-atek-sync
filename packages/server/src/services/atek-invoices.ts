@@ -219,6 +219,64 @@ export async function getUsedSKUIds(): Promise<string[]> {
   return result.map((r) => r._id.toString())
 }
 
+// Unique SKU from invoices with details
+export interface InvoiceSKU {
+  skuId: string
+  code: string | null
+  name: string | null
+  description: string | null
+  unitPrice: number | null
+  taxable: boolean
+  invoiceCount: number
+}
+
+// Get all unique SKUs used in invoices with their details
+export async function getUniqueSKUsFromInvoices(): Promise<InvoiceSKU[]> {
+  const collection = await getCollection<ATEKInvoice>(COLLECTION_NAME)
+
+  const result = await collection
+    .aggregate([
+      // Only active invoices
+      { $match: { status: { $in: ['sent', 'paid', 'partial', 'overdue'] } } },
+      // Unwind the skus array
+      { $unwind: '$skus' },
+      // Group by SKU code (or sku ObjectId if code is missing)
+      {
+        $group: {
+          _id: { $ifNull: ['$skus.code', { $toString: '$skus.sku' }] },
+          skuId: { $first: { $toString: '$skus.sku' } },
+          code: { $first: '$skus.code' },
+          name: { $first: '$skus.name' },
+          description: { $first: '$skus.description' },
+          unitPrice: { $first: '$skus.unit_price' },
+          taxable: { $first: { $ifNull: ['$skus.taxable', false] } },
+          invoiceCount: { $sum: 1 },
+        },
+      },
+      // Sort by invoice count (most used first)
+      { $sort: { invoiceCount: -1 } },
+    ])
+    .toArray()
+
+  return result.map((r) => {
+    const skuId = r.skuId || r._id
+    // Use skuId as code if code is not set (common pattern in ATEK data)
+    const code = r.code || skuId
+    // Extract name from first line of description if name is not set
+    const name = r.name || (r.description ? r.description.split('\n')[0].trim() : null)
+
+    return {
+      skuId,
+      code,
+      name,
+      description: r.description || null,
+      unitPrice: r.unitPrice || null,
+      taxable: r.taxable || false,
+      invoiceCount: r.invoiceCount,
+    }
+  })
+}
+
 // Get invoices that haven't been synced yet
 export async function getUnsyncedInvoiceIds(syncedInvoiceIds: string[]): Promise<NormalizedInvoice[]> {
   const collection = await getCollection<ATEKInvoice>(COLLECTION_NAME)

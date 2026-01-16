@@ -147,6 +147,14 @@ export const quickbooksRouter = router({
     incomeAccounts: publicProcedure.query(async () => {
       return items.getIncomeAccounts()
     }),
+
+    expenseAccounts: publicProcedure.query(async () => {
+      return items.getExpenseAccounts()
+    }),
+
+    assetAccounts: publicProcedure.query(async () => {
+      return items.getAssetAccounts()
+    }),
   }),
 
   // Invoice operations

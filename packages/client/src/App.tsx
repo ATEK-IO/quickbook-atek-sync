@@ -1,6 +1,7 @@
 import { BrowserRouter, Routes, Route, Link } from 'react-router-dom'
 import Dashboard from './pages/Dashboard'
 import CustomerMapping from './pages/CustomerMapping'
+import SkuMapping from './pages/SkuMapping'
 
 function App() {
   return (
@@ -32,7 +33,7 @@ function App() {
           <Routes>
             <Route path="/" element={<Dashboard />} />
             <Route path="/customers" element={<CustomerMapping />} />
-            <Route path="/skus" element={<div>SKU Mapping (Coming Soon)</div>} />
+            <Route path="/skus" element={<SkuMapping />} />
             <Route path="/invoices" element={<div>Invoice Sync (Coming Soon)</div>} />
           </Routes>
         </main>
