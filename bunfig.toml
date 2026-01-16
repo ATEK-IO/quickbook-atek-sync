@@ -1,0 +1,3 @@
+[run]
+# Load .env file from project root
+env-file = ".env"
