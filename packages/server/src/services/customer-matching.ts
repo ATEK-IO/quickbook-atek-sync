@@ -16,6 +16,7 @@ import { eq, and } from 'drizzle-orm'
 import { listOrganizations, type NormalizedOrganization } from './atek-organizations'
 import { listCustomers, type QBCustomer } from './qb-customers'
 import { getContractualManagersByOrganization } from './atek-invoices'
+import { getUsersByIds } from './atek-managers'
 import {
   extractOrgNumber,
   extractNameFromDisplayName,
@@ -341,6 +342,7 @@ async function logMatchingAttempt(
 
 /**
  * Get all customer mappings with their status
+ * Fetches actual manager names from invoice data (not stored mapping data)
  */
 export async function getCustomerMappings(options?: {
   status?: 'proposed' | 'approved' | 'rejected' | 'needs_review'
@@ -357,10 +359,29 @@ export async function getCustomerMappings(options?: {
 
   const results = await query.limit(limit).offset(offset)
 
-  return results.map((r) => ({
-    ...r,
-    confidenceFactors: r.confidenceFactors ? JSON.parse(r.confidenceFactors) : null,
-  }))
+  // Extract unique manager IDs from results and fetch only those users
+  const uniqueManagerIds = [...new Set(
+    results
+      .map((r) => r.atekContractualManagerId)
+      .filter((id): id is string => id !== null && id !== undefined)
+  )]
+  const managers = await getUsersByIds(uniqueManagerIds)
+  const managerMap = new Map(managers.map((m) => [m.id, m]))
+
+  return results.map((r) => {
+    // Use actual manager data from ATEK if available
+    const actualManager = r.atekContractualManagerId
+      ? managerMap.get(r.atekContractualManagerId)
+      : null
+
+    return {
+      ...r,
+      // Override with actual manager data (keep stored data as fallback)
+      atekContractualManagerName: actualManager?.name || r.atekContractualManagerName,
+      atekContractualManagerEmail: actualManager?.email || r.atekContractualManagerEmail,
+      confidenceFactors: r.confidenceFactors ? JSON.parse(r.confidenceFactors) : null,
+    }
+  })
 }
 
 /**

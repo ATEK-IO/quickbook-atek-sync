@@ -1,19 +1,21 @@
 import { ObjectId } from 'mongodb'
 import { getCollection } from '../lib/mongodb'
 
-// ATEK User/Manager structure
+// ATEK User/Manager structure (actual MongoDB schema - uses lowercase field names)
 export interface ATEKUser {
   _id: ObjectId
   email: string
-  firstName?: string
-  lastName?: string
+  firstname?: string // lowercase in MongoDB
+  lastname?: string // lowercase in MongoDB
   name?: string // Some systems use full name
   role?: string
-  status: 'active' | 'inactive' | 'pending'
+  status?: 'active' | 'inactive' | 'pending'
+  enabled?: boolean
   phone?: string
-  organizations?: ObjectId[] // Organizations this user manages
-  createdAt: Date
-  updatedAt: Date
+  organisations?: ObjectId[] // Organizations this user manages (lowercase 's')
+  organization?: ObjectId // Single organization
+  created_at?: Date
+  updated_at?: Date
 }
 
 // Normalized manager for sync
@@ -42,13 +44,22 @@ export async function listContractualManagers(options?: {
   const collection = await getCollection<ATEKUser>(COLLECTION_NAME)
 
   const filter: Record<string, unknown> = {}
-  if (activeOnly) filter.status = 'active'
+  if (activeOnly) {
+    // Check either status or enabled field
+    filter.$or = [
+      { status: 'active' },
+      { enabled: true }
+    ]
+  }
 
   // Filter for users who are managers or have organizations assigned
-  filter.$or = [
-    { role: { $in: ['manager', 'contractual_manager', 'account_manager'] } },
-    { organizations: { $exists: true, $ne: [] } },
-  ]
+  filter.$and = filter.$and || []
+  ;(filter.$and as unknown[]).push({
+    $or: [
+      { role: { $in: ['manager', 'contractual_manager', 'account_manager'] } },
+      { organisations: { $exists: true, $ne: [] } },
+    ]
+  })
 
   const managers = await collection
     .find(filter)
@@ -57,6 +68,26 @@ export async function listContractualManagers(options?: {
     .toArray()
 
   return managers.map(normalizeManager)
+}
+
+// Get users by specific IDs (for looking up managers from invoices)
+export async function getUsersByIds(ids: string[]): Promise<NormalizedManager[]> {
+  if (ids.length === 0) return []
+
+  const collection = await getCollection<ATEKUser>(COLLECTION_NAME)
+
+  // Convert string IDs to ObjectIds, filtering out invalid ones
+  const objectIds = ids
+    .filter((id) => id && ObjectId.isValid(id))
+    .map((id) => new ObjectId(id))
+
+  if (objectIds.length === 0) return []
+
+  const users = await collection
+    .find({ _id: { $in: objectIds } })
+    .toArray()
+
+  return users.map(normalizeManager)
 }
 
 // Get manager by ID
@@ -85,13 +116,22 @@ export async function searchManagers(query: string): Promise<NormalizedManager[]
 
   const managers = await collection
     .find({
-      $or: [
-        { email: { $regex: query, $options: 'i' } },
-        { name: { $regex: query, $options: 'i' } },
-        { firstName: { $regex: query, $options: 'i' } },
-        { lastName: { $regex: query, $options: 'i' } },
-      ],
-      status: 'active',
+      $and: [
+        {
+          $or: [
+            { email: { $regex: query, $options: 'i' } },
+            { name: { $regex: query, $options: 'i' } },
+            { firstname: { $regex: query, $options: 'i' } },
+            { lastname: { $regex: query, $options: 'i' } },
+          ]
+        },
+        {
+          $or: [
+            { status: 'active' },
+            { enabled: true }
+          ]
+        }
+      ]
     })
     .limit(100)
     .toArray()
@@ -104,11 +144,12 @@ export async function getManagerCount(activeOnly = true): Promise<number> {
   const collection = await getCollection<ATEKUser>(COLLECTION_NAME)
 
   const filter: Record<string, unknown> = {}
-  if (activeOnly) filter.status = 'active'
-  filter.$or = [
-    { role: { $in: ['manager', 'contractual_manager', 'account_manager'] } },
-    { organizations: { $exists: true, $ne: [] } },
-  ]
+  if (activeOnly) {
+    filter.$or = [
+      { status: 'active' },
+      { enabled: true }
+    ]
+  }
 
   return collection.countDocuments(filter)
 }
@@ -119,8 +160,15 @@ export async function getManagersForOrganization(organizationId: string): Promis
 
   const managers = await collection
     .find({
-      organizations: new ObjectId(organizationId),
-      status: 'active',
+      $and: [
+        { organisations: new ObjectId(organizationId) },
+        {
+          $or: [
+            { status: 'active' },
+            { enabled: true }
+          ]
+        }
+      ]
     })
     .toArray()
 
@@ -129,8 +177,9 @@ export async function getManagersForOrganization(organizationId: string): Promis
 
 // Normalize manager for consistent output
 function normalizeManager(user: ATEKUser): NormalizedManager {
-  const firstName = user.firstName || null
-  const lastName = user.lastName || null
+  // Use lowercase field names from MongoDB
+  const firstName = user.firstname || null
+  const lastName = user.lastname || null
   const fullName = user.name || [firstName, lastName].filter(Boolean).join(' ') || user.email.split('@')[0]
 
   return {
@@ -140,7 +189,7 @@ function normalizeManager(user: ATEKUser): NormalizedManager {
     firstName,
     lastName,
     phone: user.phone || null,
-    status: user.status,
-    organizationIds: user.organizations?.map((id) => id.toString()) || [],
+    status: user.status || (user.enabled ? 'active' : 'inactive'),
+    organizationIds: user.organisations?.map((id) => id.toString()) || [],
   }
 }
