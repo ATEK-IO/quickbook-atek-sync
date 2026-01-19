@@ -1,4 +1,4 @@
-import { createApiClient, withRetry } from '../lib/quickbooks'
+import { createApiClient, withRetry, qbApiCall } from '../lib/quickbooks'
 
 export interface QBInvoiceLine {
   Id?: string
@@ -14,6 +14,15 @@ export interface QBInvoiceLine {
   }
 }
 
+export interface QBAddress {
+  Line1?: string
+  Line2?: string
+  City?: string
+  CountrySubDivisionCode?: string
+  PostalCode?: string
+  Country?: string
+}
+
 export interface QBInvoice {
   Id: string
   DocNumber?: string
@@ -25,9 +34,18 @@ export interface QBInvoice {
   Balance: number
   EmailStatus?: 'NotSet' | 'NeedToSend' | 'EmailSent'
   BillEmail?: { Address: string }
+  BillAddr?: QBAddress
+  ShipAddr?: QBAddress
   CustomerMemo?: { value: string }
   PrivateNote?: string
   TxnStatus?: string
+  TxnTaxDetail?: {
+    TotalTax?: number
+    TaxLine?: Array<{
+      Amount: number
+      DetailType: string
+    }>
+  }
   LinkedTxn?: Array<{
     TxnId: string
     TxnType: string
@@ -98,18 +116,52 @@ export async function getInvoice(invoiceId: string): Promise<QBInvoice | null> {
   })
 }
 
-// Search invoices by doc number
+// Search invoices by doc number (exact match first, then LIKE)
 export async function searchInvoices(docNumber: string): Promise<QBInvoice[]> {
   const client = await createApiClient()
   if (!client) throw new Error('QuickBooks not connected')
 
   return withRetry(async () => {
+    // First try exact match
+    const { results: exactResults } = await client.invoices.getAllInvoices({
+      where: `DocNumber = '${docNumber}'`,
+      maxResults: 10,
+    })
+
+    if (exactResults && (exactResults as QBInvoice[]).length > 0) {
+      return exactResults as QBInvoice[]
+    }
+
+    // Fall back to LIKE query for partial matches
     const { results } = await client.invoices.getAllInvoices({
       where: `DocNumber LIKE '%${docNumber}%'`,
       maxResults: 100,
     })
     return results as QBInvoice[]
   })
+}
+
+// Get invoice by DocNumber using raw query
+export async function getInvoiceByDocNumber(docNumber: string): Promise<QBInvoice | null> {
+  // Use raw API query for more reliable results
+  const query = `SELECT * FROM Invoice WHERE DocNumber = '${docNumber}'`
+  const encodedQuery = encodeURIComponent(query)
+
+  try {
+    const response = await qbApiCall<{ QueryResponse: { Invoice?: QBInvoice[] } }>(
+      'GET',
+      `query?query=${encodedQuery}`
+    )
+
+    const invoices = response?.QueryResponse?.Invoice
+    if (invoices && invoices.length > 0) {
+      return invoices[0]!
+    }
+    return null
+  } catch (error) {
+    console.error('Error fetching invoice by DocNumber:', error)
+    return null
+  }
 }
 
 // Create a new invoice in QuickBooks

@@ -23,7 +23,6 @@ import {
   createInvoice as createQBInvoice,
   searchInvoices as searchQBInvoices,
   getInvoiceByDocNumber as getQBInvoiceByDocNumber,
-  listInvoices as listQBInvoices,
   type QBInvoiceCreateInput,
   type QBInvoice,
 } from './qb-invoices'
@@ -475,19 +474,22 @@ export async function listInvoicesWithValidation(options?: {
     return customerMappingByOrg.get(orgId) || null
   }
 
-  // Fetch all QB invoices in one call and build a map by DocNumber
-  // This avoids hitting QB API rate limits (429 errors)
+  // Search QB for each unique invoice number to find matches
+  // This is more reliable than bulk fetching (which is limited to 1000 results)
   const qbInvoiceMap = new Map<string, QBInvoice>()
-  try {
-    const allQBInvoices = await listQBInvoices({ maxResults: 1000 })
-    for (const qbInv of allQBInvoices) {
-      if (qbInv.DocNumber) {
-        qbInvoiceMap.set(qbInv.DocNumber.toLowerCase(), qbInv)
+  const uniqueInvoiceNumbers = [...new Set(invoices.map((inv) => inv.invoiceNumber))]
+
+  // Search in batches to avoid rate limiting
+  for (const invoiceNumber of uniqueInvoiceNumbers) {
+    try {
+      const qbInv = await getQBInvoiceByDocNumber(invoiceNumber)
+      if (qbInv) {
+        qbInvoiceMap.set(invoiceNumber.toLowerCase(), qbInv)
       }
+    } catch (e) {
+      // Continue on error - invoice just won't have a match
+      console.error(`Error searching QB for invoice ${invoiceNumber}:`, e)
     }
-  } catch (e) {
-    // If QB fetch fails, continue without match scores
-    console.error('Error fetching QB invoices for match:', e)
   }
 
   // Helper to calculate match score between ATEK and QB invoice

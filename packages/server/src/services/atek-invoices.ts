@@ -13,6 +13,20 @@ export interface ATEKInvoiceLineItem {
   taxable?: boolean
 }
 
+// ATEK Site structure
+export interface ATEKSite {
+  _id: ObjectId
+  name?: string
+  address?: string
+  city?: string
+  state?: string
+  postalCode?: string
+  country?: string
+  email?: string
+  phone?: string
+  organization?: ObjectId
+}
+
 // ATEK Invoice structure (actual MongoDB schema)
 export interface ATEKInvoice {
   _id: ObjectId
@@ -23,8 +37,15 @@ export interface ATEKInvoice {
   status: 'draft' | 'sent' | 'paid' | 'partial' | 'overdue' | 'cancelled' | 'void'
   date?: Date // Issue date
   expiration_date?: Date // Due date
+  billing_site?: ObjectId
+  billing_address?: string // Formatted billing address
+  shipping_addresses?: Array<{
+    _id?: ObjectId
+    site?: ObjectId
+    address?: string // Formatted shipping address
+  }>
   skus?: Array<{
-    sku?: ObjectId
+    sku?: ObjectId | string
     code?: string
     name?: string
     description?: string
@@ -32,33 +53,53 @@ export interface ATEKInvoice {
     unit_price?: number
     total?: number
     taxable?: boolean
+    item_number?: number
+    subtotal_id?: string | null
+    discount?: number // Percentage discount per line item
   }>
-  subtotals?: {
+  subtotals?: Array<{
+    _id?: ObjectId
+    name?: string
+    discount_type?: 'percentage' | 'fixed'
+    discount_value?: number
+  }> | {
     subtotal?: number
     tax?: number
     total?: number
   }
   total?: number
   currency?: string
-  notes?: string
+  notes?: string | string[]
   internal_notes?: string
   payment_terms?: string
   po_number?: string
   project_name?: string
   created_at?: Date
   deleted?: boolean
+  taxesAdded?: Array<{
+    taxId?: string
+    name?: string
+    rate?: number
+    amount?: number
+  }>
+  discount?: number
+  discount_type?: 'percentage' | 'fixed'
 }
 
 // Normalized invoice for sync
 export interface NormalizedInvoice {
   id: string
   invoiceNumber: string
-  organizationId: string
+  organizationId: string // The actual customer org (from 'customer' field)
   organizationName: string | null
   contractualManagerId: string | null
   status: string
   issueDate: string
   dueDate: string | null
+  billingAddress: string | null
+  shippingAddresses: Array<{
+    address: string
+  }>
   lineItems: Array<{
     skuId: string
     skuCode: string | null
@@ -66,7 +107,8 @@ export interface NormalizedInvoice {
     description: string | null
     quantity: number
     unitPrice: number
-    amount: number
+    discount: number // Percentage discount
+    amount: number // After discount
     taxable: boolean
   }>
   subtotal: number
@@ -368,6 +410,31 @@ export async function getContractualManagersByOrganization(): Promise<
   return output
 }
 
+// Get billing site by ID
+export async function getBillingSite(siteId: string): Promise<ATEKSite | null> {
+  const collection = await getCollection<ATEKSite>(process.env.ATEK_SITES_COLLECTION || 'sites')
+
+  try {
+    const site = await collection.findOne({ _id: new ObjectId(siteId) })
+    return site
+  } catch (error) {
+    console.error('Error fetching billing site:', error)
+    return null
+  }
+}
+
+// Get billing site ID from invoice
+export async function getInvoiceBillingSiteId(invoiceId: string): Promise<string | null> {
+  const collection = await getCollection<ATEKInvoice>(COLLECTION_NAME)
+
+  const invoice = await collection.findOne(
+    { _id: new ObjectId(invoiceId) },
+    { projection: { billing_site: 1 } }
+  )
+
+  return invoice?.billing_site?.toString() || null
+}
+
 // Normalize invoice for consistent output
 function normalizeInvoice(invoice: ATEKInvoice): NormalizedInvoice {
   const issueDate = invoice.date ? new Date(invoice.date).toISOString().split('T')[0]! : ''
@@ -375,32 +442,75 @@ function normalizeInvoice(invoice: ATEKInvoice): NormalizedInvoice {
     ? new Date(invoice.expiration_date).toISOString().split('T')[0]
     : null
 
+  // Map line items and calculate amounts
+  const lineItems = (invoice.skus || []).map((item) => {
+    const quantity = item.quantity || 0
+    const unitPrice = item.unit_price || 0
+    const discount = item.discount || 0 // Percentage discount
+    // Calculate amount: (quantity * unitPrice) - discount percentage
+    const grossAmount = quantity * unitPrice
+    const discountAmount = discount > 0 ? (grossAmount * discount / 100) : 0
+    const amount = item.total || (grossAmount - discountAmount)
+    return {
+      skuId: item.sku?.toString() || '',
+      skuCode: item.code || item.sku?.toString() || null,
+      skuName: item.name || null,
+      description: item.description || null,
+      quantity,
+      unitPrice,
+      discount,
+      amount,
+      taxable: item.taxable || false,
+    }
+  })
+
+  // Calculate subtotal from line items if not provided
+  const calculatedSubtotal = lineItems.reduce((sum, item) => sum + item.amount, 0)
+
+  // Handle subtotals being either an object or an array
+  let subtotal = 0
+  let taxAmount = 0
+  if (invoice.subtotals && !Array.isArray(invoice.subtotals)) {
+    subtotal = invoice.subtotals.subtotal || calculatedSubtotal
+    taxAmount = invoice.subtotals.tax || 0
+  } else {
+    subtotal = calculatedSubtotal
+    // Sum up taxesAdded if available
+    if (invoice.taxesAdded && Array.isArray(invoice.taxesAdded)) {
+      taxAmount = invoice.taxesAdded.reduce((sum, tax) => sum + (tax.amount || 0), 0)
+    }
+  }
+
+  // Handle notes being string or array
+  const notes = Array.isArray(invoice.notes)
+    ? invoice.notes.join('\n')
+    : (invoice.notes || null)
+
+  // Map shipping addresses
+  const shippingAddresses = (invoice.shipping_addresses || [])
+    .filter(addr => addr.address)
+    .map(addr => ({ address: addr.address! }))
+
   return {
     id: invoice._id.toString(),
     invoiceNumber: invoice.invoice_number || '',
-    organizationId: invoice.organisation?.toString() || '',
+    // Use 'customer' field which is the actual customer org, not 'organisation' which is internal (_ATEK_)
+    organizationId: invoice.customer?.toString() || invoice.organisation?.toString() || '',
     organizationName: null, // Not stored directly on invoice
     contractualManagerId: invoice.contractual_manager?.toString() || null,
     status: invoice.status,
     issueDate,
     dueDate,
-    lineItems: (invoice.skus || []).map((item) => ({
-      skuId: item.sku?.toString() || '',
-      skuCode: item.code || null,
-      skuName: item.name || null,
-      description: item.description || null,
-      quantity: item.quantity || 0,
-      unitPrice: item.unit_price || 0,
-      amount: item.total || 0,
-      taxable: item.taxable || false,
-    })),
-    subtotal: invoice.subtotals?.subtotal || 0,
-    taxAmount: invoice.subtotals?.tax || 0,
-    totalAmount: invoice.total || invoice.subtotals?.total || 0,
+    billingAddress: invoice.billing_address || null,
+    shippingAddresses,
+    lineItems,
+    subtotal,
+    taxAmount,
+    totalAmount: invoice.total || (subtotal + taxAmount),
     paidAmount: 0, // Not directly available
     balance: invoice.total || 0,
     currency: invoice.currency || 'CAD',
-    notes: invoice.notes || null,
+    notes,
     privateNotes: invoice.internal_notes || null,
     poNumber: invoice.po_number || null,
     projectName: invoice.project_name || null,
