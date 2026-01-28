@@ -12,7 +12,8 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { ItemCreateDialog } from '@/components/ItemCreateDialog'
-import { Plus, RefreshCw, Check, X, AlertCircle } from 'lucide-react'
+import { Plus, RefreshCw, Check, X, AlertCircle, CheckCheck } from 'lucide-react'
+import { toast } from 'sonner'
 
 interface InvoiceSKU {
   skuId: string
@@ -55,6 +56,47 @@ export default function SkuMapping() {
 
   // Fetch stats
   const { data: stats } = trpc.skuMapping.stats.useQuery()
+
+  // Mutation to approve a single match
+  const approveMatch = trpc.skuMapping.approveMatch.useMutation({
+    onSuccess: () => {
+      toast.success('SKU mapping approved')
+      refetch()
+    },
+    onError: (error) => {
+      toast.error(`Failed to approve mapping: ${error.message}`)
+    },
+  })
+
+  // Mutation to approve all matches
+  const approveAllMatches = trpc.skuMapping.approveAllMatches.useMutation({
+    onSuccess: (result) => {
+      toast.success(`Approved ${result.approvedCount} SKU mappings`)
+      refetch()
+    },
+    onError: (error) => {
+      toast.error(`Failed to approve all matches: ${error.message}`)
+    },
+  })
+
+  const handleApproveMatch = (match: SKUMatchResult) => {
+    if (!match.qbItem) return
+
+    approveMatch.mutate({
+      atekSkuId: match.atekSku.skuId,
+      atekSkuCode: match.atekSku.code || '',
+      atekSkuName: match.atekSku.name || '',
+      quickbooksItemId: match.qbItem.Id,
+      quickbooksItemName: match.qbItem.Name,
+      quickbooksItemType: match.qbItem.Type,
+      matchType: match.matchType as 'exact_code' | 'exact_name' | 'fuzzy_name' | 'manual',
+      confidenceScore: match.confidence,
+    })
+  }
+
+  const handleApproveAll = () => {
+    approveAllMatches.mutate()
+  }
 
   const formatPrice = (price?: number | null) => {
     if (price === undefined || price === null) return '-'
@@ -109,6 +151,16 @@ export default function SkuMapping() {
             <RefreshCw className={`h-4 w-4 mr-2 ${isRefetching ? 'animate-spin' : ''}`} />
             Rafraîchir
           </Button>
+          {matchedCount > 0 && (
+            <Button
+              size="sm"
+              onClick={handleApproveAll}
+              disabled={approveAllMatches.isPending}
+            >
+              <CheckCheck className="h-4 w-4 mr-2" />
+              {approveAllMatches.isPending ? 'Approving...' : `Approve All Matches (${matchedCount})`}
+            </Button>
+          )}
         </div>
       </div>
 
@@ -229,15 +281,28 @@ export default function SkuMapping() {
                         )}
                       </TableCell>
                       <TableCell className="text-right">
-                        {match.matchType === 'no_match' && (
-                          <Button
-                            size="sm"
-                            onClick={() => handleCreateSku(match.atekSku)}
-                          >
-                            <Plus className="h-4 w-4 mr-1" />
-                            Créer
-                          </Button>
-                        )}
+                        <div className="flex items-center justify-end gap-2">
+                          {match.matchType !== 'no_match' && match.qbItem && (
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              onClick={() => handleApproveMatch(match)}
+                              disabled={approveMatch.isPending}
+                            >
+                              <Check className="h-4 w-4 mr-1" />
+                              Approuver
+                            </Button>
+                          )}
+                          {match.matchType === 'no_match' && (
+                            <Button
+                              size="sm"
+                              onClick={() => handleCreateSku(match.atekSku)}
+                            >
+                              <Plus className="h-4 w-4 mr-1" />
+                              Créer
+                            </Button>
+                          )}
+                        </div>
                       </TableCell>
                     </TableRow>
                   ))}
@@ -258,6 +323,9 @@ export default function SkuMapping() {
         defaultDescription={selectedSku?.description || ''}
         defaultPrice={selectedSku?.unitPrice || undefined}
         defaultTaxable={selectedSku?.taxable}
+        atekSkuId={selectedSku?.skuId}
+        atekSkuCode={selectedSku?.code || undefined}
+        atekSkuName={selectedSku?.name || undefined}
       />
     </div>
   )

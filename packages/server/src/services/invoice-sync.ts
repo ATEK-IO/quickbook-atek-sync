@@ -411,13 +411,15 @@ async function getSkuMappingForItem(item: {
  */
 export async function listInvoicesWithValidation(options?: {
   status?: 'all' | 'pending' | 'ready' | 'blocked' | 'synced'
+  search?: string
   limit?: number
   offset?: number
 }): Promise<InvoiceForSync[]> {
-  const { status = 'all', limit = 100, offset = 0 } = options || {}
+  const { status = 'all', search, limit = 100, offset = 0 } = options || {}
 
-  // Get ATEK invoices
-  const invoices = await listInvoicesForSync({ limit: limit + offset })
+  // Get ATEK invoices - fetch more when searching to ensure we find matches
+  const fetchLimit = search?.trim() ? 1000 : limit + offset
+  const invoices = await listInvoicesForSync({ limit: fetchLimit })
 
   // Get ATEK organizations for org number and name
   const atekOrgs = await listATEKOrganizations()
@@ -474,10 +476,36 @@ export async function listInvoicesWithValidation(options?: {
     return customerMappingByOrg.get(orgId) || null
   }
 
-  // Search QB for each unique invoice number to find matches
-  // This is more reliable than bulk fetching (which is limited to 1000 results)
+  // Pre-filter invoices by search BEFORE QB lookups (for performance)
+  let preFilteredInvoices = invoices
+  if (search?.trim()) {
+    const query = search.toLowerCase().trim()
+    preFilteredInvoices = invoices.filter((inv) => {
+      const atekOrg = atekOrgMap.get(inv.organizationId)
+      const orgNumber = atekOrg?.orgNumber ? String(atekOrg.orgNumber).padStart(4, '0') : ''
+      const orgName = atekOrg?.name || inv.organizationName || ''
+      return (
+        inv.invoiceNumber?.toLowerCase().includes(query) ||
+        orgName.toLowerCase().includes(query) ||
+        orgNumber.toLowerCase().includes(query)
+      )
+    })
+  }
+
+  // Pre-filter by status BEFORE QB lookups
+  if (status !== 'all') {
+    preFilteredInvoices = preFilteredInvoices.filter((inv) => {
+      const validation = validationMap.get(inv.id)
+      return (validation?.validationStatus || 'pending') === status
+    })
+  }
+
+  // Apply pagination BEFORE QB lookups
+  const paginatedInvoices = preFilteredInvoices.slice(offset, offset + limit)
+
+  // Search QB only for paginated invoices (much faster!)
   const qbInvoiceMap = new Map<string, QBInvoice>()
-  const uniqueInvoiceNumbers = [...new Set(invoices.map((inv) => inv.invoiceNumber))]
+  const uniqueInvoiceNumbers = [...new Set(paginatedInvoices.map((inv) => inv.invoiceNumber))]
 
   // Search in batches to avoid rate limiting
   for (const invoiceNumber of uniqueInvoiceNumbers) {
@@ -546,8 +574,8 @@ export async function listInvoicesWithValidation(options?: {
     return Math.round((matchedWeight / totalWeight) * 100)
   }
 
-  // Combine data
-  const results: InvoiceForSync[] = invoices.map((inv) => {
+  // Combine data (only for paginated invoices)
+  const results: InvoiceForSync[] = paginatedInvoices.map((inv) => {
     const validation = validationMap.get(inv.id)
     const custMapping = findMapping(inv.organizationId, inv.contractualManagerId)
     const atekOrg = atekOrgMap.get(inv.organizationId)
@@ -595,14 +623,8 @@ export async function listInvoicesWithValidation(options?: {
     }
   })
 
-  // Filter by status
-  let filtered = results
-  if (status !== 'all') {
-    filtered = results.filter((inv) => inv.validationStatus === status)
-  }
-
-  // Apply pagination
-  return filtered.slice(offset, offset + limit)
+  // Already filtered and paginated above, just return results
+  return results
 }
 
 /**

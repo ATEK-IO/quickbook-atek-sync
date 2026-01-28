@@ -1,4 +1,5 @@
 import { BrowserRouter, Routes, Route, Link } from 'react-router-dom'
+import { Toaster } from 'sonner'
 import Dashboard from './pages/Dashboard'
 import CustomerMapping from './pages/CustomerMapping'
 import SkuMapping from './pages/SkuMapping'
@@ -7,6 +8,7 @@ import InvoicesPage from './pages/InvoicesPage'
 function App() {
   return (
     <BrowserRouter>
+      <Toaster position="top-right" richColors />
       <div className="min-h-screen bg-background">
         <nav className="border-b">
           <div className="container mx-auto px-4 py-3 flex items-center justify-between">

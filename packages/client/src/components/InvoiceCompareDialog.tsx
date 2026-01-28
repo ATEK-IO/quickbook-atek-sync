@@ -4,9 +4,11 @@ import {
   DialogContent,
   DialogHeader,
   DialogTitle,
+  DialogFooter,
 } from '@/components/ui/dialog'
 import { Badge } from '@/components/ui/badge'
-import { Check, X, ExternalLink, AlertCircle } from 'lucide-react'
+import { Button } from '@/components/ui/button'
+import { Check, X, ExternalLink, AlertCircle, Send, Loader2, Lock } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 interface InvoiceCompareDialogProps {
@@ -14,6 +16,8 @@ interface InvoiceCompareDialogProps {
   onOpenChange: (open: boolean) => void
   atekInvoiceId: string
   qbInvoiceId?: string
+  validationStatus?: 'pending' | 'ready' | 'blocked' | 'synced'
+  onSyncSuccess?: () => void
 }
 
 // Quebec tax rates
@@ -26,11 +30,35 @@ export function InvoiceCompareDialog({
   onOpenChange,
   atekInvoiceId,
   qbInvoiceId,
+  validationStatus,
+  onSyncSuccess,
 }: InvoiceCompareDialogProps) {
+  const utils = trpc.useUtils()
+
   const { data, isLoading } = trpc.invoiceSync.compare.useQuery(
     { atekInvoiceId, qbInvoiceId },
     { enabled: open && !!atekInvoiceId }
   )
+
+  // Fetch validation status if not provided
+  const { data: validationData } = trpc.invoiceSync.getValidationStatus.useQuery(
+    { invoiceId: atekInvoiceId },
+    { enabled: open && !!atekInvoiceId && !validationStatus }
+  )
+
+  const currentStatus = validationStatus || validationData?.validationStatus || 'pending'
+  const isSynced = currentStatus === 'synced'
+  const isReady = currentStatus === 'ready'
+
+  // Sync mutation
+  const syncInvoice = trpc.invoiceSync.sync.useMutation({
+    onSuccess: () => {
+      utils.invoiceSync.list.invalidate()
+      utils.invoiceSync.stats.invalidate()
+      utils.invoiceSync.getDashboardStats.invalidate()
+      onSyncSuccess?.()
+    },
+  })
 
   const formatCurrency = (amount: number | undefined | null) => {
     if (amount === undefined || amount === null) return '-'
@@ -73,11 +101,15 @@ export function InvoiceCompareDialog({
     ? `https://qbo.intuit.com/app/invoice?txnId=${data.qb.id}`
     : null
 
-  // Calculate ATEK tax - always calculate from subtotal if not provided
+  // Calculate ATEK tax - ALWAYS calculate expected Quebec tax from subtotal
+  // This ensures proper comparison with QB even when ATEK shows taxAmount: 0
   const atekSubtotal = data?.atek?.subtotal || 0
 
-  // Always calculate tax on ATEK side (Quebec rates)
-  const atekTax = data?.atek?.taxAmount || calculateTaxFromSubtotal(atekSubtotal)
+  // Always calculate expected tax on ATEK side (Quebec rates: GST 5% + QST 9.975%)
+  const atekExpectedTax = calculateTaxFromSubtotal(atekSubtotal)
+  const atekReportedTax = data?.atek?.taxAmount || 0
+  // Use expected tax for comparison, but show both if different
+  const atekTax = atekExpectedTax
   const atekTotal = atekSubtotal + atekTax
 
   // Format ATEK customer name with org number prefix
@@ -175,29 +207,41 @@ export function InvoiceCompareDialog({
     )
   )
 
-  // Comparison row component
+  // Comparison row component with difference highlighting
   const CompareRow = ({
     label,
     atekValue,
     qbValue,
     match,
-    className
+    className,
+    highlightDiff = true
   }: {
     label: string
     atekValue: React.ReactNode
     qbValue: React.ReactNode
     match?: boolean
     className?: string
-  }) => (
-    <tr className={cn("border-b", className)}>
-      <td className="py-2 px-3 font-medium text-sm text-muted-foreground w-[140px]">{label}</td>
-      <td className="py-2 px-3 text-sm">{atekValue}</td>
-      <td className="py-2 px-3 text-sm">{qbValue}</td>
-      <td className="py-2 px-3 text-center w-[40px]">
-        {match !== undefined && <MatchIndicator match={match} />}
-      </td>
-    </tr>
-  )
+    highlightDiff?: boolean
+  }) => {
+    // Determine cell background based on match status
+    const getCellBg = () => {
+      if (match === undefined || !highlightDiff) return ''
+      return match
+        ? 'bg-green-50 dark:bg-green-950/30'
+        : 'bg-red-50 dark:bg-red-950/30'
+    }
+
+    return (
+      <tr className={cn("border-b", className)}>
+        <td className="py-2 px-3 font-medium text-sm text-muted-foreground w-[140px]">{label}</td>
+        <td className={cn("py-2 px-3 text-sm", getCellBg())}>{atekValue}</td>
+        <td className={cn("py-2 px-3 text-sm", getCellBg())}>{qbValue}</td>
+        <td className="py-2 px-3 text-center w-[40px]">
+          {match !== undefined && <MatchIndicator match={match} />}
+        </td>
+      </tr>
+    )
+  }
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -227,26 +271,24 @@ export function InvoiceCompareDialog({
           <div className="text-center py-8">Loading...</div>
         ) : data?.error ? (
           <div className="text-center py-8 text-red-500">{data.error}</div>
-        ) : !data?.qb ? (
+        ) : !data?.atek ? (
           <div className="text-center py-8">
             <AlertCircle className="h-12 w-12 text-muted-foreground mx-auto mb-4" />
-            <p className="text-muted-foreground">No matching QuickBooks invoice found</p>
-            <p className="text-sm text-muted-foreground mt-2">
-              Invoice #{data?.atek?.invoiceNumber} has not been synced to QuickBooks yet.
-            </p>
-            {atekUrl && (
-              <a
-                href={atekUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex items-center gap-1 text-blue-600 hover:text-blue-800 mt-4"
-              >
-                Open in ATEK <ExternalLink className="h-4 w-4" />
-              </a>
-            )}
+            <p className="text-muted-foreground">ATEK invoice not found</p>
           </div>
         ) : (
           <div className="space-y-4">
+            {/* No QB invoice notice */}
+            {!data?.qb && (
+              <div className="bg-amber-50 border border-amber-200 rounded-md p-3 flex items-center gap-3">
+                <AlertCircle className="h-5 w-5 text-amber-600 flex-shrink-0" />
+                <div>
+                  <p className="text-sm font-medium text-amber-800">No matching QuickBooks invoice found</p>
+                  <p className="text-xs text-amber-600">Invoice #{data?.atek?.invoiceNumber} has not been synced to QuickBooks yet.</p>
+                </div>
+              </div>
+            )}
+
             {/* Main comparison table */}
             <table className="w-full">
               <thead>
@@ -296,13 +338,13 @@ export function InvoiceCompareDialog({
                       )}
                     </div>
                   }
-                  match={compareStrings(data.atek?.invoiceNumber, data.qb?.invoiceNumber)}
+                  match={data.qb ? compareStrings(data.atek?.invoiceNumber, data.qb?.invoiceNumber) : undefined}
                 />
                 <CompareRow
                   label="Customer"
                   atekValue={<div className="font-medium">{formatAtekCustomerName()}</div>}
-                  qbValue={<div className="font-medium">{data.qb?.customerName}</div>}
-                  match={compareStrings(data.atek?.customerName, data.qb?.customerName)}
+                  qbValue={<div className="font-medium">{data.qb?.customerName || '-'}</div>}
+                  match={data.qb ? compareStrings(data.atek?.customerName, data.qb?.customerName) : undefined}
                 />
                 <CompareRow
                   label="Manager"
@@ -319,13 +361,13 @@ export function InvoiceCompareDialog({
                   label="Billing Email"
                   atekValue={data.atek?.billingEmail || '-'}
                   qbValue={data.qb?.customerEmail && data.qb.customerEmail !== '-' ? data.qb.customerEmail : '-'}
-                  match={compareEmails(data.atek?.billingEmail, data.qb?.customerEmail)}
+                  match={data.qb ? compareEmails(data.atek?.billingEmail, data.qb?.customerEmail) : undefined}
                 />
                 <CompareRow
                   label="Billing Address"
                   atekValue={<div className="whitespace-pre-line text-xs">{data.atek?.billingAddress || '-'}</div>}
-                  qbValue={<div className="whitespace-pre-line text-xs">{formatQBAddress(data.qb?.billingAddress)}</div>}
-                  match={compareAddresses(data.atek?.billingAddress, data.qb?.billingAddress)}
+                  qbValue={<div className="whitespace-pre-line text-xs">{data.qb ? formatQBAddress(data.qb?.billingAddress) : '-'}</div>}
+                  match={data.qb ? compareAddresses(data.atek?.billingAddress, data.qb?.billingAddress) : undefined}
                 />
                 <CompareRow
                   label="Shipping Address"
@@ -336,23 +378,23 @@ export function InvoiceCompareDialog({
                         : '-'}
                     </div>
                   }
-                  qbValue={<div className="whitespace-pre-line text-xs">{formatQBAddress(data.qb?.shippingAddress)}</div>}
-                  match={compareAddresses(
+                  qbValue={<div className="whitespace-pre-line text-xs">{data.qb ? formatQBAddress(data.qb?.shippingAddress) : '-'}</div>}
+                  match={data.qb ? compareAddresses(
                     data.atek?.shippingAddresses?.[0]?.address,
                     data.qb?.shippingAddress
-                  )}
+                  ) : undefined}
                 />
                 <CompareRow
                   label="Issue Date"
                   atekValue={data.atek?.issueDate || '-'}
                   qbValue={data.qb?.issueDate || '-'}
-                  match={compareDates(data.atek?.issueDate, data.qb?.issueDate)}
+                  match={data.qb ? compareDates(data.atek?.issueDate, data.qb?.issueDate) : undefined}
                 />
                 <CompareRow
                   label="Due Date"
                   atekValue={data.atek?.dueDate || '-'}
                   qbValue={data.qb?.dueDate || '-'}
-                  match={compareDates(data.atek?.dueDate, data.qb?.dueDate)}
+                  match={data.qb ? compareDates(data.atek?.dueDate, data.qb?.dueDate) : undefined}
                 />
                 <CompareRow
                   label="PO Number"
@@ -362,28 +404,35 @@ export function InvoiceCompareDialog({
                 <CompareRow
                   label="Line Items"
                   atekValue={`${data.atek?.lineItems?.length || 0} items`}
-                  qbValue={`${data.qb?.lineItems?.length || 0} items`}
-                  match={(data.atek?.lineItems?.length || 0) === (data.qb?.lineItems?.length || 0)}
+                  qbValue={data.qb ? `${data.qb?.lineItems?.length || 0} items` : '-'}
+                  match={data.qb ? (data.atek?.lineItems?.length || 0) === (data.qb?.lineItems?.length || 0) : undefined}
                 />
                 <CompareRow
                   label="Subtotal"
                   atekValue={formatCurrency(atekSubtotal)}
-                  qbValue={formatCurrency(data.qb?.subtotal)}
-                  match={compareNumbers(atekSubtotal, data.qb?.subtotal)}
+                  qbValue={data.qb ? formatCurrency(data.qb?.subtotal) : '-'}
+                  match={data.qb ? compareNumbers(atekSubtotal, data.qb?.subtotal) : undefined}
                   className="bg-muted/30"
                 />
                 <CompareRow
                   label="Tax (GST+QST)"
-                  atekValue={formatCurrency(atekTax)}
-                  qbValue={formatCurrency(data.qb?.taxAmount)}
-                  match={compareNumbers(atekTax, data.qb?.taxAmount, 1)}
+                  atekValue={
+                    <div>
+                      <span>{formatCurrency(atekTax)}</span>
+                      {atekReportedTax === 0 && atekTax > 0 && (
+                        <span className="text-xs text-muted-foreground ml-1">(calculated)</span>
+                      )}
+                    </div>
+                  }
+                  qbValue={data.qb ? formatCurrency(data.qb?.taxAmount) : '-'}
+                  match={data.qb ? compareNumbers(atekTax, data.qb?.taxAmount, 1) : undefined}
                   className="bg-muted/30"
                 />
                 <CompareRow
                   label="Total"
                   atekValue={<span className="font-bold text-lg">{formatCurrency(atekTotal)}</span>}
-                  qbValue={<span className="font-bold text-lg">{formatCurrency(data.qb?.total)}</span>}
-                  match={compareNumbers(atekTotal, data.qb?.total, 1)}
+                  qbValue={data.qb ? <span className="font-bold text-lg">{formatCurrency(data.qb?.total)}</span> : '-'}
+                  match={data.qb ? compareNumbers(atekTotal, data.qb?.total, 1) : undefined}
                   className="bg-muted/30"
                 />
               </tbody>
@@ -391,7 +440,7 @@ export function InvoiceCompareDialog({
 
             {/* Line Items Comparison */}
             <div className="mt-6">
-              <h3 className="font-semibold mb-2">Line Items Comparison</h3>
+              <h3 className="font-semibold mb-2">Line Items {data.qb ? 'Comparison' : ''}</h3>
               <div className="border rounded-md overflow-hidden">
                 <table className="w-full text-xs">
                   <thead className="bg-muted">
@@ -413,15 +462,15 @@ export function InvoiceCompareDialog({
                     {(() => {
                       const atekItems = data.atek?.lineItems || []
                       const qbItems = data.qb?.lineItems || []
-                      const maxLen = Math.max(atekItems.length, qbItems.length)
+                      const maxLen = Math.max(atekItems.length, qbItems.length, 1)
                       const rows = []
 
                       for (let i = 0; i < maxLen; i++) {
                         const atekItem = atekItems[i]
                         const qbItem = qbItems[i]
 
-                        // Check if amounts match
-                        const amountsMatch = atekItem && qbItem &&
+                        // Check if amounts match (only when both exist)
+                        const amountsMatch = data.qb && atekItem && qbItem &&
                           compareNumbers(atekItem.amount, qbItem.amount, 0.01) &&
                           compareNumbers(atekItem.quantity, qbItem.quantity, 0.01)
 
@@ -438,8 +487,15 @@ export function InvoiceCompareDialog({
                           return qbItem.sku || '-'
                         }
 
+                        // Row background based on match status
+                        const rowBg = data.qb && atekItem && qbItem
+                          ? amountsMatch
+                            ? 'bg-green-50 dark:bg-green-950/30'
+                            : 'bg-red-50 dark:bg-red-950/30'
+                          : ''
+
                         rows.push(
-                          <tr key={i} className="border-t">
+                          <tr key={i} className={cn("border-t", rowBg)}>
                             <td className="p-2 text-xs font-mono text-muted-foreground" title={atekItem?.skuCode || atekItem?.skuName || ''}>
                               {getAtekSku()}
                             </td>
@@ -459,7 +515,7 @@ export function InvoiceCompareDialog({
                             <td className="p-2 text-right">{qbItem ? formatCurrency(qbItem.unitPrice) : '-'}</td>
                             <td className="p-2 text-right">{qbItem ? formatCurrency(qbItem.amount) : '-'}</td>
                             <td className="p-2 text-center border-l-2">
-                              {atekItem && qbItem && (
+                              {data.qb && atekItem && qbItem && (
                                 amountsMatch ? (
                                   <Check className="h-4 w-4 text-green-500 inline" />
                                 ) : (
@@ -478,7 +534,7 @@ export function InvoiceCompareDialog({
                       <td colSpan={4} className="p-2 text-right">ATEK Subtotal:</td>
                       <td className="p-2 text-right">{formatCurrency(atekSubtotal)}</td>
                       <td colSpan={4} className="p-2 text-right border-l-2">QB Subtotal:</td>
-                      <td className="p-2 text-right">{formatCurrency(data.qb?.subtotal)}</td>
+                      <td className="p-2 text-right">{data.qb ? formatCurrency(data.qb?.subtotal) : '-'}</td>
                       <td className="border-l-2"></td>
                     </tr>
                   </tfoot>
@@ -489,22 +545,71 @@ export function InvoiceCompareDialog({
             {/* Notes */}
             {(data.atek?.notes || data.qb?.memo) && (
               <div className="mt-4 grid grid-cols-2 gap-4">
-                {data.atek?.notes && (
-                  <div>
-                    <h4 className="font-semibold text-sm text-muted-foreground mb-1">ATEK Notes</h4>
-                    <p className="text-sm whitespace-pre-line bg-muted/30 p-2 rounded">{data.atek.notes}</p>
-                  </div>
-                )}
-                {data.qb?.memo && (
-                  <div>
-                    <h4 className="font-semibold text-sm text-muted-foreground mb-1">QB Memo</h4>
-                    <p className="text-sm bg-muted/30 p-2 rounded">{data.qb.memo}</p>
-                  </div>
-                )}
+                <div>
+                  <h4 className="font-semibold text-sm text-muted-foreground mb-1">ATEK Notes</h4>
+                  <p className="text-sm whitespace-pre-line bg-muted/30 p-2 rounded">{data.atek?.notes || '-'}</p>
+                </div>
+                <div>
+                  <h4 className="font-semibold text-sm text-muted-foreground mb-1">QB Memo</h4>
+                  <p className="text-sm bg-muted/30 p-2 rounded">{data.qb?.memo || '-'}</p>
+                </div>
               </div>
             )}
           </div>
         )}
+
+        {/* Footer with actions */}
+        <DialogFooter className="gap-2 sm:gap-0 mt-6 pt-4 border-t">
+          {/* Synced status badge */}
+          {isSynced && (
+            <div className="flex items-center gap-2 mr-auto text-sm text-muted-foreground">
+              <Lock className="h-4 w-4 text-green-600" />
+              <span>This invoice has been synced to QuickBooks</span>
+            </div>
+          )}
+
+          {/* Error display */}
+          {syncInvoice.isError && (
+            <div className="mr-auto text-sm text-destructive flex items-center gap-1">
+              <AlertCircle className="h-4 w-4" />
+              {syncInvoice.error?.message || 'Failed to sync'}
+            </div>
+          )}
+
+          {/* Success message */}
+          {syncInvoice.isSuccess && (
+            <div className="mr-auto text-sm text-green-600 flex items-center gap-1">
+              <Check className="h-4 w-4" />
+              Invoice synced successfully!
+            </div>
+          )}
+
+          <Button variant="outline" onClick={() => onOpenChange(false)}>
+            Close
+          </Button>
+
+          {/* Sync button - show for ready or blocked invoices (not synced) */}
+          {!isSynced && (
+            <Button
+              onClick={() => syncInvoice.mutate({ invoiceId: atekInvoiceId })}
+              disabled={syncInvoice.isPending || currentStatus === 'blocked'}
+              variant={isReady ? 'default' : 'secondary'}
+              title={currentStatus === 'blocked' ? 'Resolve blocking issues before syncing' : undefined}
+            >
+              {syncInvoice.isPending ? (
+                <>
+                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                  Syncing...
+                </>
+              ) : (
+                <>
+                  <Send className="h-4 w-4 mr-2" />
+                  {data?.qb ? 'Update in QuickBooks' : 'Push to QuickBooks'}
+                </>
+              )}
+            </Button>
+          )}
+        </DialogFooter>
       </DialogContent>
     </Dialog>
   )

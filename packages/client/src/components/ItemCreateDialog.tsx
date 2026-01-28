@@ -26,6 +26,10 @@ interface ItemCreateDialogProps {
   defaultDescription?: string
   defaultPrice?: number
   defaultTaxable?: boolean
+  // Optional: ATEK SKU info for auto-creating mapping after item creation
+  atekSkuId?: string
+  atekSkuCode?: string
+  atekSkuName?: string
 }
 
 interface FormData {
@@ -71,6 +75,9 @@ export function ItemCreateDialog({
   defaultDescription,
   defaultPrice,
   defaultTaxable,
+  atekSkuId,
+  atekSkuCode,
+  atekSkuName,
 }: ItemCreateDialogProps) {
   const [formData, setFormData] = useState<FormData>({
     ...initialFormData,
@@ -110,8 +117,30 @@ export function ItemCreateDialog({
     }
   }, [open, defaultName, defaultSku, defaultDescription, defaultPrice, defaultTaxable])
 
+  // Mutation to approve SKU mapping after creating QB item
+  const approveMapping = trpc.skuMapping.approveMatch.useMutation()
+
   const createItem = trpc.quickbooks.items.create.useMutation({
-    onSuccess: () => {
+    onSuccess: async (createdItem) => {
+      // If ATEK SKU info was provided, create the mapping automatically
+      if (atekSkuId && atekSkuCode && createdItem?.Id) {
+        try {
+          await approveMapping.mutateAsync({
+            atekSkuId,
+            atekSkuCode,
+            atekSkuName: atekSkuName || formData.Name,
+            quickbooksItemId: createdItem.Id,
+            quickbooksItemName: createdItem.Name,
+            quickbooksItemType: createdItem.Type,
+            matchType: 'manual',
+            confidenceScore: 1.0,
+          })
+        } catch (mappingError) {
+          console.error('Failed to create SKU mapping:', mappingError)
+          // Continue anyway - item was created successfully
+        }
+      }
+
       setFormData(initialFormData)
       setError(null)
       onOpenChange(false)

@@ -19,12 +19,15 @@
     "db:generate": "bun run --cwd packages/server db:generate",
     "db:migrate": "bun run --cwd packages/server db:migrate",
     "db:studio": "bun run --cwd packages/server db:studio",
-    "test": "bunx playwright test",
-    "test:ui": "bunx playwright test --ui"
+    "test": "npx @playwright/test test",
+    "test:ui": "npx @playwright/test test --ui"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
     "@playwright/test": "^1.49.1",
     "typescript": "^5.7.2"
+  },
+  "dependencies": {
+    "google-auth-library": "^10.5.0"
   }
 }
