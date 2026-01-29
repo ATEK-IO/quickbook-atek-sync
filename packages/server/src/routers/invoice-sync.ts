@@ -18,7 +18,7 @@ export const invoiceSyncRouter = router({
     .input(
       z
         .object({
-          status: z.enum(['all', 'pending', 'ready', 'blocked', 'synced']).optional(),
+          status: z.enum(['all', 'pending', 'ready', 'blocked', 'synced', 'not_synced']).optional(),
           search: z.string().optional(),
           limit: z.number().optional(),
           offset: z.number().optional(),
@@ -76,9 +76,14 @@ export const invoiceSyncRouter = router({
 
   // Sync a single invoice to QuickBooks
   sync: publicProcedure
-    .input(z.object({ invoiceId: z.string() }))
+    .input(z.object({
+      invoiceId: z.string(),
+      qbCustomerId: z.string().optional(), // Override customer mapping
+    }))
     .mutation(async ({ input }) => {
-      return sync.syncInvoice(input.invoiceId)
+      return sync.syncInvoice(input.invoiceId, {
+        qbCustomerId: input.qbCustomerId,
+      })
     }),
 
   // Sync multiple invoices to QuickBooks
@@ -231,6 +236,7 @@ export const invoiceSyncRouter = router({
         qb: qbInvoice ? {
           id: qbInvoice.Id,
           invoiceNumber: qbInvoice.DocNumber || '-',
+          customerId: qbInvoice.CustomerRef?.value || null,
           customerName: qbInvoice.CustomerRef?.name || '-',
           customerEmail: qbInvoice.BillEmail?.Address || qbCustomer?.PrimaryEmailAddr?.Address || '-',
           billingAddress: qbInvoice.BillAddr || qbCustomer?.BillAddr ? {

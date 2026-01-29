@@ -1,3 +1,4 @@
+import { useState, useEffect } from 'react'
 import { trpc } from '@/lib/trpc'
 import {
   Dialog,
@@ -8,6 +9,7 @@ import {
 } from '@/components/ui/dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { Select } from '@/components/ui/select'
 import { Check, X, ExternalLink, AlertCircle, Send, Loader2, Lock } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
@@ -35,10 +37,28 @@ export function InvoiceCompareDialog({
 }: InvoiceCompareDialogProps) {
   const utils = trpc.useUtils()
 
-  const { data, isLoading } = trpc.invoiceSync.compare.useQuery(
+  // State for customer override
+  const [selectedQbCustomerId, setSelectedQbCustomerId] = useState<string | undefined>()
+
+  const { data, isLoading, refetch: refetchCompare } = trpc.invoiceSync.compare.useQuery(
     { atekInvoiceId, qbInvoiceId },
     { enabled: open && !!atekInvoiceId }
   )
+
+  // Fetch QB customers for selector
+  const { data: qbCustomers } = trpc.quickbooks.customers.list.useQuery(
+    { activeOnly: true },
+    { enabled: open }
+  )
+
+  // Reset selected customer when dialog opens or data changes
+  useEffect(() => {
+    if (open && data?.qb?.customerId) {
+      setSelectedQbCustomerId(data.qb.customerId)
+    } else if (!open) {
+      setSelectedQbCustomerId(undefined)
+    }
+  }, [open, data?.qb?.customerId])
 
   // Fetch validation status if not provided
   const { data: validationData } = trpc.invoiceSync.getValidationStatus.useQuery(
@@ -52,13 +72,23 @@ export function InvoiceCompareDialog({
 
   // Sync mutation
   const syncInvoice = trpc.invoiceSync.sync.useMutation({
-    onSuccess: () => {
+    onSuccess: (data) => {
+      if (!data.success) return
       utils.invoiceSync.list.invalidate()
       utils.invoiceSync.stats.invalidate()
       utils.invoiceSync.getDashboardStats.invalidate()
+      utils.invoiceSync.getValidationStatus.invalidate()
+      // Force immediate refetch of this dialog's compare data to show fresh QB values
+      refetchCompare()
       onSyncSuccess?.()
     },
   })
+
+  // Build customer options for selector
+  const customerOptions = (qbCustomers || []).map((c) => ({
+    value: c.Id,
+    label: c.DisplayName,
+  }))
 
   const formatCurrency = (amount: number | undefined | null) => {
     if (amount === undefined || amount === null) return '-'
@@ -162,7 +192,10 @@ export function InvoiceCompareDialog({
       .trim()
     // Check if they share significant content (city + postal code at minimum)
     const atekHasCity = qbAddr.city && normalizedAtek.includes(qbAddr.city.toLowerCase())
-    const atekHasPostal = qbAddr.postalCode && normalizedAtek.includes(qbAddr.postalCode.toLowerCase().replace(/\s/g, ''))
+    // Remove spaces from BOTH when comparing postal codes (e.g., "H3A 2M7" vs "H3A2M7")
+    const atekAddrNoSpaces = normalizedAtek.replace(/\s/g, '')
+    const qbPostalNoSpaces = qbAddr.postalCode?.toLowerCase().replace(/\s/g, '')
+    const atekHasPostal = qbPostalNoSpaces && atekAddrNoSpaces.includes(qbPostalNoSpaces)
     return atekHasCity && atekHasPostal
   }
 
@@ -343,7 +376,27 @@ export function InvoiceCompareDialog({
                 <CompareRow
                   label="Customer"
                   atekValue={<div className="font-medium">{formatAtekCustomerName()}</div>}
-                  qbValue={<div className="font-medium">{data.qb?.customerName || '-'}</div>}
+                  qbValue={
+                    <div className="font-medium">
+                      {syncInvoice.isPending ? (
+                        <div className="flex items-center gap-2 text-muted-foreground">
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                          <span>Updating...</span>
+                        </div>
+                      ) : !isSynced ? (
+                        <Select
+                          options={customerOptions}
+                          value={selectedQbCustomerId}
+                          onChange={setSelectedQbCustomerId}
+                          placeholder="Select QB Customer..."
+                          searchable
+                          className="w-full min-w-[200px]"
+                        />
+                      ) : (
+                        data.qb?.customerName || '-'
+                      )}
+                    </div>
+                  }
                   match={data.qb ? compareStrings(data.atek?.customerName, data.qb?.customerName) : undefined}
                 />
                 <CompareRow
@@ -569,15 +622,15 @@ export function InvoiceCompareDialog({
           )}
 
           {/* Error display */}
-          {syncInvoice.isError && (
+          {(syncInvoice.isError || (syncInvoice.isSuccess && !syncInvoice.data?.success)) && (
             <div className="mr-auto text-sm text-destructive flex items-center gap-1">
               <AlertCircle className="h-4 w-4" />
-              {syncInvoice.error?.message || 'Failed to sync'}
+              {syncInvoice.error?.message || syncInvoice.data?.error || 'Failed to sync'}
             </div>
           )}
 
           {/* Success message */}
-          {syncInvoice.isSuccess && (
+          {syncInvoice.isSuccess && syncInvoice.data?.success && (
             <div className="mr-auto text-sm text-green-600 flex items-center gap-1">
               <Check className="h-4 w-4" />
               Invoice synced successfully!
@@ -588,18 +641,22 @@ export function InvoiceCompareDialog({
             Close
           </Button>
 
-          {/* Sync button - show for ready or blocked invoices (not synced) */}
-          {!isSynced && (
+          {/* Sync/Update button */}
+          {/* Show for: not synced invoices, OR synced invoices with QB data (to allow fixing taxes/addresses) */}
+          {(!isSynced || data?.qb) && (
             <Button
-              onClick={() => syncInvoice.mutate({ invoiceId: atekInvoiceId })}
-              disabled={syncInvoice.isPending || currentStatus === 'blocked'}
-              variant={isReady ? 'default' : 'secondary'}
-              title={currentStatus === 'blocked' ? 'Resolve blocking issues before syncing' : undefined}
+              onClick={() => syncInvoice.mutate({
+                invoiceId: atekInvoiceId,
+                qbCustomerId: selectedQbCustomerId,
+              })}
+              disabled={syncInvoice.isPending || (currentStatus === 'blocked' && !data?.qb)}
+              variant={isReady || data?.qb ? 'default' : 'secondary'}
+              title={currentStatus === 'blocked' && !data?.qb ? 'Resolve blocking issues before syncing' : undefined}
             >
               {syncInvoice.isPending ? (
                 <>
                   <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                  Syncing...
+                  {isSynced ? 'Updating...' : 'Syncing...'}
                 </>
               ) : (
                 <>

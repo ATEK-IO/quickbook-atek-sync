@@ -25,6 +25,7 @@ export interface QBAddress {
 
 export interface QBInvoice {
   Id: string
+  SyncToken?: string
   DocNumber?: string
   TxnDate: string
   DueDate?: string
@@ -73,8 +74,24 @@ export interface QBInvoiceCreateInput {
   TxnDate?: string
   DueDate?: string
   BillEmail?: { Address: string }
+  BillAddr?: QBAddress
+  ShipAddr?: QBAddress
   CustomerMemo?: { value: string }
   PrivateNote?: string
+  TxnTaxDetail?: {
+    TxnTaxCodeRef?: { value: string }
+    TotalTax?: number
+    TaxLine?: Array<{
+      Amount: number
+      DetailType: string
+      TaxLineDetail: {
+        TaxRateRef: { value: string }
+        PercentBased?: boolean
+        TaxPercent?: number
+        NetAmountTaxable?: number
+      }
+    }>
+  }
 }
 
 // List all invoices from QuickBooks
@@ -181,22 +198,28 @@ export async function createInvoice(input: QBInvoiceCreateInput): Promise<QBInvo
   })
 }
 
-// Update an existing invoice
+// Update an existing invoice using raw API (sparse update)
 export async function updateInvoice(
   invoiceId: string,
   syncToken: string,
   updates: Partial<QBInvoiceCreateInput>
 ): Promise<QBInvoice> {
-  const client = await createApiClient()
-  if (!client) throw new Error('QuickBooks not connected')
+  // QuickBooks requires sparse: true for partial updates
+  // Must include Id and SyncToken
+  const updatePayload = {
+    Id: invoiceId,
+    SyncToken: syncToken,
+    sparse: true,
+    ...updates,
+  }
 
   return withRetry(async () => {
-    const { results } = await client.invoices.updateInvoice({
-      Id: invoiceId,
-      SyncToken: syncToken,
-      ...updates,
-    })
-    return results as QBInvoice
+    const response = await qbApiCall<{ Invoice: QBInvoice }>(
+      'POST',
+      'invoice',
+      updatePayload
+    )
+    return response.Invoice
   })
 }
 

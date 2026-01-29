@@ -481,10 +481,16 @@ function normalizeInvoice(invoice: ATEKInvoice): NormalizedInvoice {
     }
   }
 
-  // Handle notes being string or array
-  const notes = Array.isArray(invoice.notes)
-    ? invoice.notes.join('\n')
-    : (invoice.notes || null)
+  // Handle notes being string, array of strings, or array of note objects
+  let notes: string | null = null
+  if (Array.isArray(invoice.notes)) {
+    notes = invoice.notes
+      .map(n => typeof n === 'string' ? n : (n.text || n.content || n.note || ''))
+      .filter(Boolean)
+      .join('\n') || null
+  } else {
+    notes = invoice.notes || null
+  }
 
   // Map shipping addresses
   const shippingAddresses = (invoice.shipping_addresses || [])

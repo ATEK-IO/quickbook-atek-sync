@@ -21,10 +21,12 @@ import { listOrganizations as listATEKOrganizations } from './atek-organizations
 import { getUsersByIds } from './atek-managers'
 import {
   createInvoice as createQBInvoice,
+  updateInvoice as updateQBInvoice,
   searchInvoices as searchQBInvoices,
   getInvoiceByDocNumber as getQBInvoiceByDocNumber,
   type QBInvoiceCreateInput,
   type QBInvoice,
+  type QBAddress,
 } from './qb-invoices'
 import {
   getValidationStatus,
@@ -32,6 +34,137 @@ import {
   checkCustomerMapping,
   type CustomerValidationResult,
 } from './invoice-validation'
+
+// ============================================================================
+// QuickBooks Tax Code & Rate IDs (Quebec)
+// Query: SELECT * FROM TaxCode / TaxRate (see scripts/query-tax-codes.ts)
+// ============================================================================
+const QB_TAX_CODE_TAXABLE = '9'   // "TPS/TVQ QC - 9,975" = GST 5% + QST 9.975%
+const QB_TAX_CODE_EXEMPT = '3'    // "Hors champ" = No tax
+const QB_TAX_RATE_TPS = '7'       // TPS (GST) 5%
+const QB_TAX_RATE_TVQ = '21'      // TVQ (QST) 9.975%
+const QB_TAX_PERCENT_TPS = 5
+const QB_TAX_PERCENT_TVQ = 9.975
+
+/**
+ * Build TxnTaxDetail for Quebec taxes (TPS + TVQ)
+ * Required for both create and update operations
+ */
+function buildQCTaxDetail(subtotal: number) {
+  const tpsAmount = Math.round(subtotal * QB_TAX_PERCENT_TPS) / 100
+  const tvqAmount = Math.round(subtotal * QB_TAX_PERCENT_TVQ) / 100
+  const totalTax = Math.round((tpsAmount + tvqAmount) * 100) / 100
+
+  return {
+    TxnTaxCodeRef: { value: QB_TAX_CODE_TAXABLE },
+    TotalTax: totalTax,
+    TaxLine: [
+      {
+        Amount: tpsAmount,
+        DetailType: 'TaxLineDetail',
+        TaxLineDetail: {
+          TaxRateRef: { value: QB_TAX_RATE_TPS },
+          PercentBased: true,
+          TaxPercent: QB_TAX_PERCENT_TPS,
+          NetAmountTaxable: subtotal,
+        },
+      },
+      {
+        Amount: tvqAmount,
+        DetailType: 'TaxLineDetail',
+        TaxLineDetail: {
+          TaxRateRef: { value: QB_TAX_RATE_TVQ },
+          PercentBased: true,
+          TaxPercent: QB_TAX_PERCENT_TVQ,
+          NetAmountTaxable: subtotal,
+        },
+      },
+    ],
+  }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/**
+ * Parse ATEK address string into QuickBooks address format
+ * ATEK format is typically:
+ * Line 1: Company/Site name
+ * Line 2: Street address
+ * Line 3: City Province PostalCode
+ */
+function parseAddressToQB(addressString: string | null | undefined): QBAddress | undefined {
+  if (!addressString || !addressString.trim()) {
+    return undefined
+  }
+
+  const lines = addressString.split('\n').map(l => l.trim()).filter(Boolean)
+  if (lines.length === 0) return undefined
+
+  const address: QBAddress = {}
+
+  if (lines[0]) address.Line1 = lines[0]
+  if (lines[1]) address.Line2 = lines[1]
+
+  // Parse the last line for City, Province, PostalCode, Country
+  const lastLineRaw = lines[lines.length - 1] || ''
+
+  // Strip country suffix and set Country field
+  let lastLine = lastLineRaw
+  const countryMatch = lastLine.match(/,?\s*(CANADA|Canada|CA)$/i)
+  if (countryMatch) {
+    address.Country = 'CA'
+    lastLine = lastLine.slice(0, countryMatch.index).trim()
+  }
+
+  // Parse city/province/postal from last line when we have 3+ lines
+  if (lines.length >= 3) {
+    // Canadian postal code pattern: A1A 1A1 (anywhere in the remaining string)
+    const postalCodeMatch = lastLine.match(/([A-Z]\d[A-Z]\s?\d[A-Z]\d)/i)
+
+    if (postalCodeMatch) {
+      address.PostalCode = postalCodeMatch[1].toUpperCase()
+      const beforePostal = lastLine.slice(0, postalCodeMatch.index).trim()
+
+      const provinces = ['Québec', 'Quebec', 'Ontario', 'Alberta', 'BC', 'Manitoba', 'Saskatchewan', 'Nova Scotia', 'New Brunswick', 'QC', 'ON', 'AB', 'MB', 'SK', 'NS', 'NB', 'PE', 'NL']
+      for (const prov of provinces) {
+        if (beforePostal.toLowerCase().includes(prov.toLowerCase())) {
+          const provIndex = beforePostal.toLowerCase().lastIndexOf(prov.toLowerCase())
+          address.City = beforePostal.slice(0, provIndex).trim()
+          address.CountrySubDivisionCode = prov === 'Québec' || prov === 'Quebec' ? 'QC' : prov.length === 2 ? prov.toUpperCase() : prov
+          break
+        }
+      }
+
+      if (!address.City) {
+        address.City = beforePostal
+      }
+    } else {
+      address.City = lastLine || undefined
+    }
+  }
+
+  // Handle 2-line addresses
+  if (lines.length === 2 && !address.City) {
+    address.Line2 = undefined
+    let cleanLine2 = lines[1] || ''
+    const countryMatch2 = cleanLine2.match(/,?\s*(CANADA|Canada|CA)$/i)
+    if (countryMatch2) {
+      address.Country = 'CA'
+      cleanLine2 = cleanLine2.slice(0, countryMatch2.index).trim()
+    }
+    const postalCodeMatch = cleanLine2.match(/([A-Z]\d[A-Z]\s?\d[A-Z]\d)/i)
+    if (postalCodeMatch) {
+      address.PostalCode = postalCodeMatch[1].toUpperCase()
+      address.City = cleanLine2.slice(0, postalCodeMatch.index).trim()
+    } else {
+      address.Line2 = lines[1]
+    }
+  }
+
+  return address
+}
 
 // ============================================================================
 // Types
@@ -94,21 +227,19 @@ export interface SyncStats {
 
 /**
  * Sync a single invoice from ATEK to QuickBooks
+ * @param atekInvoiceId - The ATEK invoice ID to sync
+ * @param options - Optional override settings
+ * @param options.qbCustomerId - Override the QB customer ID (bypasses auto-mapping)
  */
-export async function syncInvoice(atekInvoiceId: string): Promise<InvoiceSyncResult> {
+export async function syncInvoice(
+  atekInvoiceId: string,
+  options?: { qbCustomerId?: string }
+): Promise<InvoiceSyncResult> {
   // 1. Check local validation status
   const validation = await getValidationStatus(atekInvoiceId)
 
-  if (validation?.validationStatus === 'synced') {
-    return {
-      atekInvoiceId,
-      atekInvoiceNumber: validation.atekInvoiceNumber || '',
-      success: false,
-      skippedReason: 'already_synced',
-      quickbooksInvoiceId: validation.quickbooksInvoiceId || undefined,
-      lineItemsCreated: 0,
-    }
-  }
+  // Note: We no longer block synced invoices from being updated
+  // This allows re-syncing to fix issues like missing taxes or address updates
 
   // 2. Get the ATEK invoice
   const invoice = await getATEKInvoice(atekInvoiceId)
@@ -122,61 +253,108 @@ export async function syncInvoice(atekInvoiceId: string): Promise<InvoiceSyncRes
     }
   }
 
-  // 3. Validate the invoice if not already validated
-  if (!validation || validation.validationStatus === 'pending') {
-    // Run validation first
-    const customerResult = await checkCustomerMapping(
+  // 3. Get customer mapping or use override
+  let customerResult: Awaited<ReturnType<typeof checkCustomerMapping>>
+
+  if (options?.qbCustomerId) {
+    // Use override customer ID - create a synthetic result
+    customerResult = {
+      isValid: true,
+      quickbooksCustomerId: options.qbCustomerId,
+      matchedBy: 'manual_override' as const,
+      issues: [],
+    }
+  } else {
+    // Validate the invoice if not already validated
+    if (!validation || validation.validationStatus === 'pending') {
+      // Run validation first
+      customerResult = await checkCustomerMapping(
+        invoice.organizationId,
+        invoice.contractualManagerId
+      )
+
+      if (!customerResult.isValid) {
+        return {
+          atekInvoiceId,
+          atekInvoiceNumber: invoice.invoiceNumber,
+          success: false,
+          skippedReason: 'no_customer_mapping',
+          error: 'Customer mapping not approved',
+          lineItemsCreated: 0,
+        }
+      }
+    }
+
+    // 4. Get customer mapping (needed for both create and update)
+    customerResult = await checkCustomerMapping(
       invoice.organizationId,
       invoice.contractualManagerId
     )
 
-    if (!customerResult.isValid) {
+    if (!customerResult.isValid || !customerResult.quickbooksCustomerId) {
       return {
         atekInvoiceId,
         atekInvoiceNumber: invoice.invoiceNumber,
         success: false,
         skippedReason: 'no_customer_mapping',
-        error: 'Customer mapping not approved',
+        error: customerResult.issues[0]?.message || 'No customer mapping',
         lineItemsCreated: 0,
       }
     }
   }
 
-  // 4. Check for duplicate in QuickBooks by DocNumber
+  // 5. Check for existing invoice in QuickBooks by DocNumber
   if (invoice.invoiceNumber) {
     const existingInQB = await checkDuplicateInQB(invoice.invoiceNumber)
     if (existingInQB) {
-      // Mark as synced locally to prevent future attempts
-      await markAsSynced(atekInvoiceId, `DUPLICATE:${existingInQB.Id}`)
-      return {
-        atekInvoiceId,
-        atekInvoiceNumber: invoice.invoiceNumber,
-        success: false,
-        skippedReason: 'duplicate_in_qb',
-        quickbooksInvoiceId: existingInQB.Id,
-        lineItemsCreated: 0,
+      // Build updated invoice data
+      const buildResult = await buildQBInvoice(invoice, customerResult)
+
+      if (!buildResult.success) {
+        return {
+          atekInvoiceId,
+          atekInvoiceNumber: invoice.invoiceNumber,
+          success: false,
+          skippedReason: 'missing_sku_mappings',
+          error: buildResult.error,
+          lineItemsCreated: 0,
+        }
+      }
+
+      // Update existing invoice in QuickBooks
+      // Include line items + TxnTaxDetail to apply Quebec taxes
+      try {
+        const updatedInvoice = await updateQBInvoice(
+          existingInQB.Id,
+          existingInQB.SyncToken || '0',
+          buildResult.invoice!
+        )
+
+        // Mark as synced
+        await markAsSynced(atekInvoiceId, updatedInvoice.Id)
+
+        return {
+          atekInvoiceId,
+          atekInvoiceNumber: invoice.invoiceNumber,
+          success: true,
+          quickbooksInvoiceId: updatedInvoice.Id,
+          quickbooksDocNumber: updatedInvoice.DocNumber,
+          lineItemsCreated: buildResult.invoice!.Line.length,
+        }
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error'
+        return {
+          atekInvoiceId,
+          atekInvoiceNumber: invoice.invoiceNumber,
+          success: false,
+          error: `QB Update Error: ${errorMessage}`,
+          lineItemsCreated: 0,
+        }
       }
     }
   }
 
-  // 5. Get customer mapping
-  const customerResult = await checkCustomerMapping(
-    invoice.organizationId,
-    invoice.contractualManagerId
-  )
-
-  if (!customerResult.isValid || !customerResult.quickbooksCustomerId) {
-    return {
-      atekInvoiceId,
-      atekInvoiceNumber: invoice.invoiceNumber,
-      success: false,
-      skippedReason: 'no_customer_mapping',
-      error: customerResult.issues[0]?.message || 'No customer mapping',
-      lineItemsCreated: 0,
-    }
-  }
-
-  // 6. Build QB invoice with line item mappings
+  // 6. Build QB invoice with line item mappings (for new invoice creation)
   const buildResult = await buildQBInvoice(invoice, customerResult)
 
   if (!buildResult.success) {
@@ -289,12 +467,8 @@ export async function syncAllReady(limit?: number): Promise<BatchSyncResult> {
  */
 export async function checkDuplicateInQB(invoiceNumber: string): Promise<QBInvoice | null> {
   try {
-    const results = await searchQBInvoices(invoiceNumber)
-    // Find exact match
-    const exactMatch = results.find(
-      (inv) => inv.DocNumber?.toLowerCase() === invoiceNumber.toLowerCase()
-    )
-    return exactMatch || null
+    // Use raw API query which is more reliable than SDK search
+    return await getQBInvoiceByDocNumber(invoiceNumber)
   } catch (error) {
     // If QB search fails, assume no duplicate (safer to create than to skip)
     console.error('Error checking QB duplicate:', error)
@@ -334,6 +508,10 @@ async function buildQBInvoice(
       continue
     }
 
+    // QB requires Amount === UnitPrice * Qty
+    // When amount is 0 (e.g. free/demo items), set UnitPrice to 0
+    const unitPrice = item.amount === 0 ? 0 : item.unitPrice
+
     lineItems.push({
       Amount: item.amount,
       Description: item.description || item.skuName || '',
@@ -341,7 +519,10 @@ async function buildQBInvoice(
       SalesItemLineDetail: {
         ItemRef: { value: mapping.quickbooksItemId },
         Qty: item.quantity,
-        UnitPrice: item.unitPrice,
+        UnitPrice: unitPrice,
+        // QB Tax Code ID "9" = "TPS/TVQ QC - 9,975" (GST 5% + QST 9.975%)
+        // QB Tax Code ID "3" = "Hors champ" (no tax)
+        TaxCodeRef: { value: QB_TAX_CODE_TAXABLE },
       },
     })
   }
@@ -361,6 +542,17 @@ async function buildQBInvoice(
     }
   }
 
+  // Parse billing address
+  const billAddr = parseAddressToQB(invoice.billingAddress)
+
+  // Parse shipping address (use first one if multiple)
+  const shipAddr = invoice.shippingAddresses?.[0]?.address
+    ? parseAddressToQB(invoice.shippingAddresses[0].address)
+    : undefined
+
+  // Calculate subtotal from line items for tax computation
+  const subtotal = lineItems.reduce((sum, item) => sum + item.Amount, 0)
+
   return {
     success: true,
     invoice: {
@@ -369,8 +561,11 @@ async function buildQBInvoice(
       DocNumber: invoice.invoiceNumber,
       TxnDate: invoice.issueDate,
       DueDate: invoice.dueDate || undefined,
+      BillAddr: billAddr,
+      ShipAddr: shipAddr,
       CustomerMemo: invoice.notes ? { value: invoice.notes } : undefined,
       PrivateNote: invoice.privateNotes || undefined,
+      TxnTaxDetail: buildQCTaxDetail(subtotal),
     },
   }
 }
@@ -410,11 +605,11 @@ async function getSkuMappingForItem(item: {
  * Get list of invoices with their validation status for UI display
  */
 export async function listInvoicesWithValidation(options?: {
-  status?: 'all' | 'pending' | 'ready' | 'blocked' | 'synced'
+  status?: 'all' | 'pending' | 'ready' | 'blocked' | 'synced' | 'not_synced'
   search?: string
   limit?: number
   offset?: number
-}): Promise<InvoiceForSync[]> {
+}): Promise<{ invoices: InvoiceForSync[]; total: number }> {
   const { status = 'all', search, limit = 100, offset = 0 } = options || {}
 
   // Get ATEK invoices - fetch more when searching to ensure we find matches
@@ -496,9 +691,14 @@ export async function listInvoicesWithValidation(options?: {
   if (status !== 'all') {
     preFilteredInvoices = preFilteredInvoices.filter((inv) => {
       const validation = validationMap.get(inv.id)
-      return (validation?.validationStatus || 'pending') === status
+      const invStatus = validation?.validationStatus || 'pending'
+      if (status === 'not_synced') return invStatus !== 'synced'
+      return invStatus === status
     })
   }
+
+  // Store total count before pagination
+  const totalFiltered = preFilteredInvoices.length
 
   // Apply pagination BEFORE QB lookups
   const paginatedInvoices = preFilteredInvoices.slice(offset, offset + limit)
@@ -623,8 +823,8 @@ export async function listInvoicesWithValidation(options?: {
     }
   })
 
-  // Already filtered and paginated above, just return results
-  return results
+  // Already filtered and paginated above, return with total count
+  return { invoices: results, total: totalFiltered }
 }
 
 /**

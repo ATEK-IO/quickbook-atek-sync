@@ -1,4 +1,5 @@
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useCallback, useEffect, useRef } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { trpc } from '@/lib/trpc'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
@@ -12,14 +13,17 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { Check, RefreshCw, Filter, AlertCircle, Send, ChevronDown, ChevronRight, Eye, Lock, ExternalLink, UserPlus, Package, Search, X } from 'lucide-react'
+import { Check, RefreshCw, Filter, AlertCircle, Send, ChevronDown, ChevronRight, ChevronLeft, Eye, Lock, ExternalLink, UserPlus, Package, Search, X } from 'lucide-react'
 import { InvoiceCompareDialog } from '@/components/InvoiceCompareDialog'
 import { InvoiceDashboard } from '@/components/InvoiceDashboard'
 import { InlineCustomerCreateDialog } from '@/components/InlineCustomerCreateDialog'
 import { InlineSkuCreateDialog } from '@/components/InlineSkuCreateDialog'
 import { InvoiceMatchPreview } from '@/components/InvoiceMatchPreview'
 
-type StatusFilter = 'all' | 'pending' | 'ready' | 'blocked' | 'synced'
+type StatusFilter = 'all' | 'pending' | 'ready' | 'blocked' | 'synced' | 'not_synced'
+
+const PAGE_SIZE = 20
+const VALID_STATUSES: StatusFilter[] = ['all', 'pending', 'ready', 'blocked', 'synced', 'not_synced']
 
 interface BlockingIssue {
   type: string
@@ -30,8 +34,65 @@ interface BlockingIssue {
 }
 
 export default function InvoicesPage() {
-  const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
-  const [searchQuery, setSearchQuery] = useState('')
+  const [searchParams, setSearchParams] = useSearchParams()
+
+  // Read filters from URL params (persisted across navigations)
+  const statusFilter = (VALID_STATUSES.includes(searchParams.get('status') as StatusFilter)
+    ? searchParams.get('status')
+    : 'all') as StatusFilter
+  const searchQuery = searchParams.get('q') || ''
+  const currentPage = Math.max(1, parseInt(searchParams.get('page') || '1', 10))
+
+  const setStatusFilter = useCallback((status: StatusFilter) => {
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev)
+      next.set('status', status)
+      next.delete('page') // Reset page on filter change
+      return next
+    })
+  }, [setSearchParams])
+
+  const setSearchQuery = useCallback((q: string) => {
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev)
+      if (q) {
+        next.set('q', q)
+      } else {
+        next.delete('q')
+      }
+      next.delete('page') // Reset page on search change
+      return next
+    })
+  }, [setSearchParams])
+
+  const setCurrentPage = useCallback((page: number) => {
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev)
+      if (page > 1) {
+        next.set('page', String(page))
+      } else {
+        next.delete('page')
+      }
+      return next
+    })
+  }, [setSearchParams])
+
+  // Local search input with debounce to avoid API call per keystroke
+  const [searchInput, setSearchInput] = useState(searchQuery)
+  const debounceRef = useRef<ReturnType<typeof setTimeout>>()
+
+  useEffect(() => {
+    debounceRef.current = setTimeout(() => {
+      setSearchQuery(searchInput)
+    }, 300)
+    return () => clearTimeout(debounceRef.current)
+  }, [searchInput, setSearchQuery])
+
+  // Sync local input when URL param changes externally (e.g. back button)
+  useEffect(() => {
+    setSearchInput(searchQuery)
+  }, [searchQuery])
+
   const [expandedInvoices, setExpandedInvoices] = useState<Set<string>>(new Set())
   const [compareInvoice, setCompareInvoice] = useState<{
     id: string
@@ -56,14 +117,19 @@ export default function InvoicesPage() {
 
   // Fetch invoices with validation status
   const {
-    data: invoices,
+    data: listData,
     isLoading,
     refetch: refetchInvoices,
   } = trpc.invoiceSync.list.useQuery({
     status: statusFilter === 'all' ? undefined : statusFilter,
     search: searchQuery.trim() || undefined,
-    limit: 100,
+    limit: PAGE_SIZE,
+    offset: (currentPage - 1) * PAGE_SIZE,
   })
+
+  const invoices = listData?.invoices
+  const totalCount = listData?.total ?? 0
+  const totalPages = Math.max(1, Math.ceil(totalCount / PAGE_SIZE))
 
   // Validate all pending mutation
   const validateAllPending = trpc.invoiceSync.validateAllPending.useMutation({
@@ -263,16 +329,16 @@ export default function InvoicesPage() {
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
           <Input
             placeholder="Search invoice #..."
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
+            value={searchInput}
+            onChange={(e) => setSearchInput(e.target.value)}
             className="pl-9 pr-8"
           />
-          {searchQuery && (
+          {searchInput && (
             <Button
               variant="ghost"
               size="sm"
               className="absolute right-1 top-1/2 -translate-y-1/2 h-6 w-6 p-0"
-              onClick={() => setSearchQuery('')}
+              onClick={() => { setSearchInput(''); setSearchQuery('') }}
             >
               <X className="h-3 w-3" />
             </Button>
@@ -283,26 +349,24 @@ export default function InvoicesPage() {
         <div className="flex items-center gap-2">
           <Filter className="h-4 w-4 text-muted-foreground" />
           <span className="text-sm text-muted-foreground">Filter:</span>
-          {(['all', 'pending', 'ready', 'blocked', 'synced'] as const).map((status) => (
+          {(['all', 'not_synced', 'pending', 'ready', 'blocked', 'synced'] as const).map((status) => (
             <Button
               key={status}
               variant={statusFilter === status ? 'default' : 'outline'}
               size="sm"
               onClick={() => setStatusFilter(status)}
             >
-              {status.charAt(0).toUpperCase() + status.slice(1)}
+              {status === 'not_synced' ? 'Not Synced' : status.charAt(0).toUpperCase() + status.slice(1)}
             </Button>
           ))}
         </div>
 
         <div className="flex-1" />
 
-        {/* Search results count */}
-        {searchQuery && (
-          <span className="text-sm text-muted-foreground">
-            {invoices?.length || 0} result{(invoices?.length || 0) !== 1 ? 's' : ''}
-          </span>
-        )}
+        {/* Results count */}
+        <span className="text-sm text-muted-foreground">
+          {totalCount} result{totalCount !== 1 ? 's' : ''}
+        </span>
 
         {statusFilter === 'ready' && (
           <Button variant="outline" size="sm" onClick={selectAllReady}>
@@ -314,8 +378,9 @@ export default function InvoicesPage() {
       {/* Invoices Table */}
       <Card>
         <CardContent className="p-0">
+          <div className="max-h-[calc(100vh-380px)] overflow-auto">
           <Table>
-            <TableHeader>
+            <TableHeader className="sticky top-0 z-10 bg-background shadow-sm">
               <TableRow>
                 <TableHead className="w-[40px]"></TableHead>
                 <TableHead>Invoice #</TableHead>
@@ -532,6 +597,39 @@ export default function InvoicesPage() {
               )}
             </TableBody>
           </Table>
+          </div>
+
+          {/* Pagination */}
+          {totalPages > 1 && (
+            <div className="flex items-center justify-between border-t px-4 py-3">
+              <span className="text-sm text-muted-foreground">
+                Showing {(currentPage - 1) * PAGE_SIZE + 1}–{Math.min(currentPage * PAGE_SIZE, totalCount)} of {totalCount}
+              </span>
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setCurrentPage(currentPage - 1)}
+                  disabled={currentPage <= 1}
+                >
+                  <ChevronLeft className="h-4 w-4" />
+                  Previous
+                </Button>
+                <span className="text-sm font-medium px-2">
+                  Page {currentPage} of {totalPages}
+                </span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setCurrentPage(currentPage + 1)}
+                  disabled={currentPage >= totalPages}
+                >
+                  Next
+                  <ChevronRight className="h-4 w-4" />
+                </Button>
+              </div>
+            </div>
+          )}
         </CardContent>
       </Card>
 
